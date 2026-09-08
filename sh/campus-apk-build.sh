@@ -64,12 +64,27 @@ rm -rf "$OUT_DIR"
 mkdir -p "$(dirname "$OPENWRT_ROOT")" "$OUT_DIR"
 
 git clone --filter=blob:none --no-checkout "$OPENWRT_REPO" "$OPENWRT_ROOT"
+git -C "$OPENWRT_ROOT" fetch --force --depth=1 origin "$OPENWRT_COMMIT"
 git -C "$OPENWRT_ROOT" fetch --force --depth=1 origin \
   "refs/tags/${OPENWRT_TAG}:refs/tags/${OPENWRT_TAG}"
 
-resolved_commit="$(git -C "$OPENWRT_ROOT" rev-parse "${OPENWRT_TAG}^{commit}")"
-[[ "$resolved_commit" == "$OPENWRT_COMMIT" ]] || \
-  fail "${OPENWRT_TAG} resolved to ${resolved_commit}, expected ${OPENWRT_COMMIT}"
+pinned_tree="$(git -C "$OPENWRT_ROOT" rev-parse "${OPENWRT_COMMIT}^{tree}")"
+tag_commit="$(git -C "$OPENWRT_ROOT" rev-parse "${OPENWRT_TAG}^{commit}")"
+tag_tree="$(git -C "$OPENWRT_ROOT" rev-parse "${OPENWRT_TAG}^{tree}")"
+tag_commit_matches=no
+tag_tree_matches=no
+if [[ "$tag_commit" == "$OPENWRT_COMMIT" ]]; then
+  tag_commit_matches=yes
+fi
+if [[ "$tag_tree" == "$pinned_tree" ]]; then
+  tag_tree_matches=yes
+fi
+
+[[ "$tag_tree_matches" == yes ]] || \
+  fail "${OPENWRT_TAG} source tree ${tag_tree} differs from pinned tree ${pinned_tree}"
+if [[ "$tag_commit_matches" == no ]]; then
+  echo "::notice::tag commit differs, but source tree is identical. tag=${tag_commit}, pinned=${OPENWRT_COMMIT}, tree=${pinned_tree}"
+fi
 
 git -C "$OPENWRT_ROOT" checkout --detach "$OPENWRT_COMMIT"
 [[ "$(git -C "$OPENWRT_ROOT" rev-parse HEAD)" == "$OPENWRT_COMMIT" ]] || \
@@ -237,7 +252,12 @@ python3 "$WORKSPACE/sh/campus-apk-bundle.py" \
   --final-glue "$final_glue" \
   --nft-queue-state "$nft_queue_state" \
   --nft-tproxy-state "$nft_tproxy_state" \
-  --source-commit "$OPENWRT_COMMIT" \
+  --pinned-source-commit "$OPENWRT_COMMIT" \
+  --resolved-tag-commit "$tag_commit" \
+  --pinned-tree "$pinned_tree" \
+  --resolved-tag-tree "$tag_tree" \
+  --tag-commit-matches "$tag_commit_matches" \
+  --tag-tree-matches "$tag_tree_matches" \
   --ua2f-commit "$UA2F_COMMIT" \
   --rkp-ipid-commit "$RKP_IPID_COMMIT" \
   --xray-version "$xray_version" \

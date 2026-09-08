@@ -199,7 +199,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--final-glue", required=True)
     parser.add_argument("--nft-queue-state", required=True)
     parser.add_argument("--nft-tproxy-state", required=True)
-    parser.add_argument("--source-commit", required=True)
+    parser.add_argument("--pinned-source-commit", required=True)
+    parser.add_argument("--resolved-tag-commit", required=True)
+    parser.add_argument("--pinned-tree", required=True)
+    parser.add_argument("--resolved-tag-tree", required=True)
+    parser.add_argument("--tag-commit-matches", choices=("yes", "no"), required=True)
+    parser.add_argument("--tag-tree-matches", choices=("yes", "no"), required=True)
     parser.add_argument("--ua2f-commit", required=True)
     parser.add_argument("--rkp-ipid-commit", required=True)
     parser.add_argument("--xray-version", required=True)
@@ -218,6 +223,8 @@ def main() -> int:
         fail(f"APK metadata tool is missing: {apk_tool}")
     if not args.public_key.is_file():
         fail(f"Public signing key is missing: {args.public_key}")
+    if args.tag_tree_matches != "yes":
+        fail("Resolved tag tree does not match the pinned source tree")
 
     apk_paths = sorted((source_root / "bin").rglob("*.apk"))
     if not apk_paths:
@@ -397,8 +404,12 @@ def main() -> int:
                 f"kernel={args.expected_linux}",
                 "source_repo=shiyu1314/openwrt-source",
                 "source_tag=v25.12.5",
-                "source_commit=0e38877",
-                f"source_commit_full={args.source_commit}",
+                f"pinned_source_commit={args.pinned_source_commit}",
+                f"resolved_tag_commit={args.resolved_tag_commit}",
+                f"pinned_tree={args.pinned_tree}",
+                f"resolved_tag_tree={args.resolved_tag_tree}",
+                f"tag_commit_matches={args.tag_commit_matches}",
+                f"tag_tree_matches={args.tag_tree_matches}",
                 "ua2f_version=5.2.0",
                 f"ua2f_upstream_commit={args.ua2f_commit}",
                 f"rkp_ipid_upstream_commit={args.rkp_ipid_commit}",
@@ -425,7 +436,12 @@ def main() -> int:
         f"- Architecture: {args.expected_arch}",
         f"- Linux version: {args.expected_linux}",
         f"- OpenWrt release: 25.12.5",
-        f"- Source commit: {args.source_commit}",
+        f"- pinned_source_commit={args.pinned_source_commit}",
+        f"- resolved_tag_commit={args.resolved_tag_commit}",
+        f"- pinned_tree={args.pinned_tree}",
+        f"- resolved_tag_tree={args.resolved_tag_tree}",
+        f"- tag_commit_matches={args.tag_commit_matches}",
+        f"- tag_tree_matches={args.tag_tree_matches}",
         "",
         "NETFILTER_NETLINK_GLUE_CT / UA2F",
         f"- Baseline CONFIG_NETFILTER_NETLINK_GLUE_CT: {args.baseline_glue}",
