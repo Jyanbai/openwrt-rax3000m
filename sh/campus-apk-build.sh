@@ -121,6 +121,9 @@ fi
 git -C "$OPENWRT_ROOT" checkout --detach "$OPENWRT_COMMIT"
 [[ "$(git -C "$OPENWRT_ROOT" rev-parse HEAD)" == "$OPENWRT_COMMIT" ]] || \
   fail "OpenWrt checkout is not the required source commit"
+grep -Eq '^[[:space:]]*([^#[:space:]]+[[:space:]]+)*dtb:[[:space:]]*FORCE([[:space:]]|$)' \
+  "$OPENWRT_ROOT/target/linux/Makefile" || \
+  fail "Pinned target/linux/Makefile does not expose dtb as a public target"
 
 cd "$OPENWRT_ROOT"
 ./scripts/feeds update -a
@@ -199,9 +202,11 @@ done
 
 run_make tools/install
 run_make toolchain/install
-run_make target/linux/configure
+echo "Using target/linux/dtb to materialize baseline kernel config"
+run_make target/linux/dtb
 
-find build_dir -type f -name .config | grep linux || true
+make -s val.LINUX_DIR || true
+find build_dir -type f -name .config | grep 'linux-' || true
 baseline_kernel_config="$(find_kernel_config Baseline)"
 echo "Baseline kernel config: ${baseline_kernel_config}"
 cp "$baseline_kernel_config" "$STATE_DIR/baseline-kernel.config"
@@ -250,9 +255,11 @@ fi
 
 # Recreate the kernel tree from the final config before compiling the module.
 make target/linux/clean
-run_make target/linux/configure
+echo "Using target/linux/dtb to materialize final kernel config"
+run_make target/linux/dtb
 
-find build_dir -type f -name .config | grep linux || true
+make -s val.LINUX_DIR || true
+find build_dir -type f -name .config | grep 'linux-' || true
 final_kernel_config="$(find_kernel_config Final)"
 echo "Final kernel config: ${final_kernel_config}"
 cp "$final_kernel_config" "$STATE_DIR/final-kernel.config"
