@@ -14,6 +14,12 @@ readonly PACKAGES_FEED_COMMIT="5caa62e0bc9f7fb9b0c12a23267bceb7724214dd"
 readonly EXPECTED_ARCH="aarch64_cortex-a53"
 readonly EXPECTED_LINUX="6.12.94"
 
+KERNEL_CONFIG=""
+KERNEL_LINUX_DIR=""
+KERNEL_LINUX_VERSION=""
+KERNEL_VERMAGIC=""
+KERNEL_RELEASE=""
+
 fail() {
   echo "::error::$*" >&2
   exit 1
@@ -40,25 +46,31 @@ config_state() {
   fi
 }
 
-make_value() {
+target_make_value() {
   local name="$1"
-  make -s "val.${name}" | tail -n1 | tr -d '\r'
+  local output value
+
+  if ! output="$(
+    make -s --no-print-directory -C target/linux/mediatek \
+      TOPDIR="$OPENWRT_ROOT" TARGET_BUILD=1 "val.${name}" 2>&1
+  )"; then
+    printf '%s\n' "$output" >&2
+    fail "Could not query ${name} from the mediatek target make context"
+  fi
+
+  value="$(printf '%s\n' "$output" | tail -n1 | tr -d '\r')"
+  [[ -n "$value" && "$value" != "${name} undefined" ]] || \
+    fail "${name} is undefined in the mediatek target make context"
+  printf '%s\n' "$value"
 }
 
 find_kernel_config() {
   local phase="$1"
-  local linux_dir expected_config
+  local kernel_build_dir target_build_dir build_dir_root
+  local top_level_output top_level_linux_dir top_level_linux_dir_real top_level_status=0
+  local target_linux_version vermagic_file
   local -a candidates
 
-  linux_dir="$(make_value LINUX_DIR)"
-  [[ -n "$linux_dir" && "$linux_dir" != "LINUX_DIR undefined" ]] || \
-    fail "${phase} LINUX_DIR could not be determined from OpenWrt make variables"
-  case "$linux_dir" in
-    */linux-mediatek_filogic/linux-"${EXPECTED_LINUX}") ;;
-    *) fail "${phase} LINUX_DIR is outside mediatek/filogic Linux ${EXPECTED_LINUX}: ${linux_dir}" ;;
-  esac
-
-  expected_config="${linux_dir}/.config"
   mapfile -t candidates < <(
     find build_dir -type f \
       -path "*/linux-mediatek_filogic/linux-${EXPECTED_LINUX}/.config" \
@@ -67,8 +79,9 @@ find_kernel_config() {
 
   if (( ${#candidates[@]} == 0 )); then
     echo "${phase}: no matching Linux kernel config; discovered Linux build directories:" >&2
-    find build_dir -maxdepth 4 -type d -path '*linux*' -print >&2 || true
-    fail "${phase} Linux kernel config was not generated at ${expected_config}"
+    find build_dir -maxdepth 5 -type d \
+      \( -name 'target-*' -o -name 'linux-*' \) -print >&2 || true
+    fail "${phase} Linux kernel config was not generated"
   fi
   if (( ${#candidates[@]} > 1 )); then
     echo "${phase}: multiple Linux kernel config candidates:" >&2
@@ -76,11 +89,56 @@ find_kernel_config() {
     fail "${phase} Linux kernel config selection is ambiguous"
   fi
 
-  expected_config="$(realpath -m "$expected_config")"
-  candidates[0]="$(realpath "${candidates[0]}")"
-  [[ "${candidates[0]}" == "$expected_config" ]] || \
-    fail "${phase} kernel config ${candidates[0]} does not match LINUX_DIR ${expected_config}"
-  printf '%s\n' "${candidates[0]}"
+  KERNEL_CONFIG="$(realpath "${candidates[0]}")"
+  KERNEL_LINUX_DIR="$(dirname "$KERNEL_CONFIG")"
+  kernel_build_dir="$(dirname "$KERNEL_LINUX_DIR")"
+  target_build_dir="$(dirname "$kernel_build_dir")"
+  build_dir_root="$(dirname "$target_build_dir")"
+
+  [[ "$(basename "$KERNEL_LINUX_DIR")" == "linux-${EXPECTED_LINUX}" ]] || \
+    fail "${phase} Linux directory has an unexpected version: ${KERNEL_LINUX_DIR}"
+  [[ "$(basename "$kernel_build_dir")" == "linux-mediatek_filogic" ]] || \
+    fail "${phase} kernel tree is not mediatek/filogic: ${KERNEL_LINUX_DIR}"
+  [[ "$(basename "$target_build_dir")" == "target-${EXPECTED_ARCH}_musl" ]] || \
+    fail "${phase} kernel tree is not for target-${EXPECTED_ARCH}_musl: ${KERNEL_LINUX_DIR}"
+  [[ "$(realpath "$build_dir_root")" == "$(realpath build_dir)" ]] || \
+    fail "${phase} kernel tree is not directly under the OpenWrt build_dir: ${KERNEL_LINUX_DIR}"
+
+  top_level_output="$(make -s val.LINUX_DIR 2>&1)" || top_level_status=$?
+  top_level_linux_dir="$(printf '%s\n' "$top_level_output" | tail -n1 | tr -d '\r')"
+  if (( top_level_status != 0 )); then
+    printf '%s\n' "$top_level_output" >&2
+    echo "::notice::Top-level LINUX_DIR diagnostic failed; using the resolved target build tree"
+  elif [[ -z "$top_level_linux_dir" || "$top_level_linux_dir" == "LINUX_DIR undefined" ]]; then
+    echo "Top-level LINUX_DIR: undefined (expected/acceptable outside kernel target context)"
+  else
+    top_level_linux_dir_real="$(realpath -m "$top_level_linux_dir")"
+    echo "Top-level LINUX_DIR: ${top_level_linux_dir_real}"
+    [[ "$top_level_linux_dir_real" == "$KERNEL_LINUX_DIR" ]] || \
+      fail "${phase} top-level LINUX_DIR does not match the resolved target tree"
+  fi
+
+  KERNEL_LINUX_VERSION="${KERNEL_LINUX_DIR##*/linux-}"
+  [[ "$KERNEL_LINUX_VERSION" == "$EXPECTED_LINUX" ]] || \
+    fail "${phase} kernel is ${KERNEL_LINUX_VERSION}, expected ${EXPECTED_LINUX}"
+  target_linux_version="$(target_make_value LINUX_VERSION)"
+  [[ "$target_linux_version" == "$KERNEL_LINUX_VERSION" ]] || \
+    fail "${phase} target make context reports Linux ${target_linux_version}, tree is ${KERNEL_LINUX_VERSION}"
+
+  vermagic_file="${KERNEL_LINUX_DIR}/.vermagic"
+  [[ -f "$vermagic_file" ]] || fail "${phase} kernel vermagic file is missing: ${vermagic_file}"
+  KERNEL_VERMAGIC="$(tr -d '\r\n' < "$vermagic_file")"
+  [[ -n "$KERNEL_VERMAGIC" && "$KERNEL_VERMAGIC" != "unknown" ]] || \
+    fail "${phase} kernel vermagic is empty or unknown: ${vermagic_file}"
+  [[ "$KERNEL_VERMAGIC" != *[[:space:]]* ]] || \
+    fail "${phase} kernel vermagic contains whitespace: ${vermagic_file}"
+
+  KERNEL_RELEASE="$(target_make_value LINUX_RELEASE)"
+  [[ "$KERNEL_RELEASE" != "unknown" && "$KERNEL_RELEASE" != *[[:space:]]* ]] || \
+    fail "${phase} kernel release is invalid: ${KERNEL_RELEASE}"
+
+  echo "Resolved ${phase} LINUX_DIR: ${KERNEL_LINUX_DIR}"
+  echo "${phase} kernel config: ${KERNEL_CONFIG}"
 }
 
 [[ "${GITHUB_ACTIONS:-}" == "true" ]] || \
@@ -205,16 +263,15 @@ run_make toolchain/install
 echo "Using target/linux/dtb to materialize baseline kernel config"
 run_make target/linux/dtb
 
-make -s val.LINUX_DIR || true
 find build_dir -type f -name .config | grep 'linux-' || true
-baseline_kernel_config="$(find_kernel_config Baseline)"
-echo "Baseline kernel config: ${baseline_kernel_config}"
+find_kernel_config Baseline
+baseline_kernel_config="$KERNEL_CONFIG"
 cp "$baseline_kernel_config" "$STATE_DIR/baseline-kernel.config"
 baseline_glue="$(config_state "$baseline_kernel_config" CONFIG_NETFILTER_NETLINK_GLUE_CT)"
 
-baseline_linux="$(make_value LINUX_VERSION)"
-baseline_vermagic="$(make_value LINUX_VERMAGIC)"
-baseline_release="$(make_value LINUX_RELEASE)"
+baseline_linux="$KERNEL_LINUX_VERSION"
+baseline_vermagic="$KERNEL_VERMAGIC"
+baseline_release="$KERNEL_RELEASE"
 [[ "$baseline_linux" == "$EXPECTED_LINUX" ]] || \
   fail "Baseline kernel is ${baseline_linux}, expected ${EXPECTED_LINUX}"
 [[ -n "$baseline_vermagic" && "$baseline_vermagic" != "unknown" ]] || \
@@ -258,18 +315,17 @@ make target/linux/clean
 echo "Using target/linux/dtb to materialize final kernel config"
 run_make target/linux/dtb
 
-make -s val.LINUX_DIR || true
 find build_dir -type f -name .config | grep 'linux-' || true
-final_kernel_config="$(find_kernel_config Final)"
-echo "Final kernel config: ${final_kernel_config}"
+find_kernel_config Final
+final_kernel_config="$KERNEL_CONFIG"
 cp "$final_kernel_config" "$STATE_DIR/final-kernel.config"
 final_glue="$(config_state "$final_kernel_config" CONFIG_NETFILTER_NETLINK_GLUE_CT)"
 diff -u "$STATE_DIR/baseline-kernel.config" "$STATE_DIR/final-kernel.config" \
   > "$STATE_DIR/kernel-config.diff" || true
 
-final_linux="$(make_value LINUX_VERSION)"
-final_vermagic="$(make_value LINUX_VERMAGIC)"
-final_release="$(make_value LINUX_RELEASE)"
+final_linux="$KERNEL_LINUX_VERSION"
+final_vermagic="$KERNEL_VERMAGIC"
+final_release="$KERNEL_RELEASE"
 [[ "$final_linux" == "$baseline_linux" ]] || fail "Final Linux version changed from baseline"
 [[ "$final_vermagic" == "$baseline_vermagic" ]] || fail "Final vermagic changed from baseline"
 [[ "$final_release" == "$baseline_release" ]] || fail "Final kernel release changed from baseline"
