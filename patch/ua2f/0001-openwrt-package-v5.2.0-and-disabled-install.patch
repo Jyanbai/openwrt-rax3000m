@@ -1,0 +1,14 @@
+diff --git a/openwrt/Makefile b/openwrt/Makefile
+index b33c73f..aa687bf 100644
+--- a/openwrt/Makefile
++++ b/openwrt/Makefile
+@@ -4 +4 @@ PKG_NAME:=UA2F
+-PKG_VERSION:=4.10.2
++PKG_VERSION:=5.2.0
+@@ -89,0 +90,3 @@ define Package/ua2f/postinst
++	# OpenWrt default_postinst enables init scripts before this package hook.
++	# Leave the service disabled after installation; the UCI default is also 0.
++	/etc/init.d/ua2f disable
+@@ -92 +95 @@ define Package/ua2f/postinst
+-	if [ -z "$(command -v nft)" ]; then
++	if ! command -v nft >/dev/null 2>&1; then

@@ -1,0 +1,13 @@
+diff --git a/net/xray-core/Makefile b/net/xray-core/Makefile
+index 1641210..79e9456 100644
+--- a/net/xray-core/Makefile
++++ b/net/xray-core/Makefile
+@@ -60,0 +61,8 @@ endef
++define Package/xray-core/postinst
++#!/bin/sh
++[ -n "$${IPKG_INSTROOT}" ] || {
++	/etc/init.d/xray disable
++}
++exit 0
++endef
++

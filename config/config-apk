@@ -274,3 +274,7 @@ CONFIG_PACKAGE_luci-app-momo=m
 CONFIG_PACKAGE_luci-app-nikki=m
 CONFIG_PACKAGE_luci-app-openclash=m
 
+### Standalone campus APKs (not built into firmware images)
+CONFIG_PACKAGE_ua2f=m
+CONFIG_PACKAGE_kmod-rkp-ipid=m
+CONFIG_PACKAGE_xray-core=m

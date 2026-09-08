@@ -51,29 +51,26 @@ jobs:
         echo "DEVICE_NAME=${{ matrix.device }}" >> $GITHUB_ENV
         echo "SOURCE_NAME=${{ matrix.source }}" >> $GITHUB_ENV
         echo "REPO_URL=https://github.com/shiyu1314/openwrt-source" >> $GITHUB_ENV
-        echo "REPO_BRANCH=openwrt-25.12" >> $GITHUB_ENV
+        echo "REPO_TAG=v25.12.5" >> $GITHUB_ENV
+        echo "REPO_COMMIT=0e38877debc3b65b11b4b0589268d29c6b19404f" >> $GITHUB_ENV
 
     - name: 克隆源代码
       working-directory: /workdir
       run: |
         df -hT $PWD
-        git clone $REPO_URL $SOURCE_NAME
+        git clone --depth=1 --branch "$REPO_TAG" --single-branch "$REPO_URL" "$SOURCE_NAME"
         ln -sf /workdir/$SOURCE_NAME $GITHUB_WORKSPACE/$SOURCE_NAME
         
-    - name: 切换分支
+    - name: 验证固定源码
       run: |
-        cd $SOURCE_NAME
-        case $REPO_BRANCH in
-          openwrt-25.12)
-            _release_tag=$(git tag --sort=taggerdate --list 'v25.*' | tail -1)
-            git checkout $_release_tag
-            _prerelease=false
-            ;;
-          *)
-            echo "Can't get local/upstream's branch/tags"
-            ;;
-        esac
-        echo "release_tag=$_release_tag" >> $GITHUB_ENV    
+        set -euo pipefail
+        cd "$SOURCE_NAME"
+        resolved_commit="$(git rev-parse HEAD)"
+        test "$resolved_commit" = "$REPO_COMMIT" || {
+          echo "::error::${REPO_TAG} resolved to ${resolved_commit}, expected ${REPO_COMMIT}"
+          exit 1
+        }
+        echo "release_tag=$REPO_TAG" >> "$GITHUB_ENV"
         
     - name: 取回缓存 staging_dir
       uses: actions/cache@v5
@@ -162,16 +159,9 @@ jobs:
         bash kmod-sign bin/packages/aarch64_cortex-a53/luci
         bash kmod-sign bin/packages/aarch64_cortex-a53/packages
 
-    - name: 上传apk
-      env:
-        GITHUB_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
-      run: |
-        cd $SOURCE_NAME/bin/packages
-        git init
-        git config --local user.name "github-actions[bot]"
-        git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
-        git add .
-        git commit -m "${{ env.tag }}"
-        git branch -M main
-        git remote add origin https://github-action:$GITHUB_TOKEN@github.com/shiyu1314/rax3000m
-        git push -u origin main --force
+    - name: 上传apk Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: rax3000m-25.12.5-apk-${{ env.tag }}
+        path: ${{ env.SOURCE_NAME }}/bin/packages/
+        if-no-files-found: error
