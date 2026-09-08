@@ -46,9 +46,41 @@ make_value() {
 }
 
 find_kernel_config() {
-  find build_dir -type f \
-    -path "*/linux-mediatek_filogic/linux-${EXPECTED_LINUX}/.config" \
-    -print -quit
+  local phase="$1"
+  local linux_dir expected_config
+  local -a candidates
+
+  linux_dir="$(make_value LINUX_DIR)"
+  [[ -n "$linux_dir" && "$linux_dir" != "LINUX_DIR undefined" ]] || \
+    fail "${phase} LINUX_DIR could not be determined from OpenWrt make variables"
+  case "$linux_dir" in
+    */linux-mediatek_filogic/linux-"${EXPECTED_LINUX}") ;;
+    *) fail "${phase} LINUX_DIR is outside mediatek/filogic Linux ${EXPECTED_LINUX}: ${linux_dir}" ;;
+  esac
+
+  expected_config="${linux_dir}/.config"
+  mapfile -t candidates < <(
+    find build_dir -type f \
+      -path "*/linux-mediatek_filogic/linux-${EXPECTED_LINUX}/.config" \
+      -print | sort
+  )
+
+  if (( ${#candidates[@]} == 0 )); then
+    echo "${phase}: no matching Linux kernel config; discovered Linux build directories:" >&2
+    find build_dir -maxdepth 4 -type d -path '*linux*' -print >&2 || true
+    fail "${phase} Linux kernel config was not generated at ${expected_config}"
+  fi
+  if (( ${#candidates[@]} > 1 )); then
+    echo "${phase}: multiple Linux kernel config candidates:" >&2
+    printf '  %s\n' "${candidates[@]}" >&2
+    fail "${phase} Linux kernel config selection is ambiguous"
+  fi
+
+  expected_config="$(realpath -m "$expected_config")"
+  candidates[0]="$(realpath "${candidates[0]}")"
+  [[ "${candidates[0]}" == "$expected_config" ]] || \
+    fail "${phase} kernel config ${candidates[0]} does not match LINUX_DIR ${expected_config}"
+  printf '%s\n' "${candidates[0]}"
 }
 
 [[ "${GITHUB_ACTIONS:-}" == "true" ]] || \
@@ -167,10 +199,11 @@ done
 
 run_make tools/install
 run_make toolchain/install
-run_make target/linux/prepare
+run_make target/linux/configure
 
-baseline_kernel_config="$(find_kernel_config)"
-[[ -n "$baseline_kernel_config" ]] || fail "Baseline Linux kernel config was not generated"
+find build_dir -type f -name .config | grep linux || true
+baseline_kernel_config="$(find_kernel_config Baseline)"
+echo "Baseline kernel config: ${baseline_kernel_config}"
 cp "$baseline_kernel_config" "$STATE_DIR/baseline-kernel.config"
 baseline_glue="$(config_state "$baseline_kernel_config" CONFIG_NETFILTER_NETLINK_GLUE_CT)"
 
@@ -217,10 +250,11 @@ fi
 
 # Recreate the kernel tree from the final config before compiling the module.
 make target/linux/clean
-run_make target/linux/prepare
+run_make target/linux/configure
 
-final_kernel_config="$(find_kernel_config)"
-[[ -n "$final_kernel_config" ]] || fail "Final Linux kernel config was not generated"
+find build_dir -type f -name .config | grep linux || true
+final_kernel_config="$(find_kernel_config Final)"
+echo "Final kernel config: ${final_kernel_config}"
 cp "$final_kernel_config" "$STATE_DIR/final-kernel.config"
 final_glue="$(config_state "$final_kernel_config" CONFIG_NETFILTER_NETLINK_GLUE_CT)"
 diff -u "$STATE_DIR/baseline-kernel.config" "$STATE_DIR/final-kernel.config" \
