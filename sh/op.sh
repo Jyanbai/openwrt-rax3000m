@@ -2,12 +2,17 @@
 
 set -x
 
+CUSTOM_REPO_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+
 # kenrel Vermagic
 sed -ie 's/^\(.\).*vermagic$/\1cp $(TOPDIR)\/.vermagic $(LINUX_DIR)\/.vermagic/' include/kernel-defaults.mk
 grep HASH target/linux/generic/kernel-6.12 | awk -F'HASH-' '{print $2}' | awk '{print $1}' | md5sum | awk '{print $1}' > .vermagic
 
 git clone -b packages --depth 1 --single-branch https://github.com/shiyu1314/openwrt-feeds package/xd
 git clone -b porxy --depth 1 --single-branch https://github.com/shiyu1314/openwrt-feeds package/porxy
+
+rm -rf package/portal-dns-guard
+cp -a "$CUSTOM_REPO_ROOT/package/portal-dns-guard" package/portal-dns-guard
 
 rm -rf feeds/luci/applications/{luci-app-dockerman,luci-app-samba4,luci-app-aria2,luci-app-diskman}
 rm -rf feeds/packages/net/{samba4,v2ray-geodata,mosdns,sing-box,aria2,ariang,adguardhome}

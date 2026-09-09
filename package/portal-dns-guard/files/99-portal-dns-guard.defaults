@@ -1,0 +1,86 @@
+#!/bin/sh
+
+# One-time image defaults only.  Runtime state changes never write UCI.
+
+UCI_BIN="${PORTAL_DNS_UCI_BIN:-uci}"
+DEFAULTS_VERSION=1
+MANAGED_SERVERS_FILE=/tmp/hosts/portal-dns/servers
+
+current_version="$("$UCI_BIN" -q get portal-dns-guard.main.defaults_version 2>/dev/null || true)"
+case "$current_version" in
+	''|*[!0-9]*) ;;
+	*) [ "$current_version" -lt "$DEFAULTS_VERSION" ] || exit 0 ;;
+esac
+
+# Do not use the native UCI serversfile option here.  OpenWrt 25.12 adds that
+# individual file to the dnsmasq ujail after already mounting /tmp/hosts.  A
+# file bind mount would keep the old inode after the guard atomically renames
+# the servers-file.  extraconftext lives in dnsmasq's mounted confdir while the
+# referenced file is reached through the existing /tmp/hosts directory mount.
+merge_dnsmasq_extraconf() {
+	local current filtered managed
+	managed="servers-file=$MANAGED_SERVERS_FILE"
+	current="$("$UCI_BIN" -q get dhcp.@dnsmasq[0].extraconftext 2>/dev/null || true)"
+	filtered="$(printf '%s\n' "$current" | awk -v managed="$managed" '$0 != managed')"
+	if [ -n "$filtered" ]; then
+		"$UCI_BIN" -q set "dhcp.@dnsmasq[0].extraconftext=$filtered
+$managed"
+	else
+		"$UCI_BIN" -q set "dhcp.@dnsmasq[0].extraconftext=$managed"
+	fi
+}
+
+"$UCI_BIN" -q set 'dhcp.@dnsmasq[0].noresolv=1'
+"$UCI_BIN" -q set 'dhcp.@dnsmasq[0].ignore_hosts_dir=0'
+"$UCI_BIN" -q delete 'dhcp.@dnsmasq[0].server' || true
+"$UCI_BIN" -q delete 'dhcp.@dnsmasq[0].serversfile' || true
+merge_dnsmasq_extraconf
+
+"$UCI_BIN" -q set dnsproxy.global.enabled='1'
+"$UCI_BIN" -q set dnsproxy.global.ipv6_disabled='1'
+"$UCI_BIN" -q set dnsproxy.global.http3='0'
+"$UCI_BIN" -q set dnsproxy.global.insecure='0'
+"$UCI_BIN" -q set dnsproxy.cache.enabled='0'
+"$UCI_BIN" -q set dnsproxy.cache.cache_optimistic='0'
+"$UCI_BIN" -q delete dnsproxy.global.listen_addr || true
+"$UCI_BIN" -q add_list dnsproxy.global.listen_addr='127.0.0.1'
+"$UCI_BIN" -q delete dnsproxy.global.listen_port || true
+"$UCI_BIN" -q add_list dnsproxy.global.listen_port='5354'
+"$UCI_BIN" -q delete dnsproxy.servers.bootstrap || true
+"$UCI_BIN" -q add_list dnsproxy.servers.bootstrap='223.5.5.5:53'
+"$UCI_BIN" -q add_list dnsproxy.servers.bootstrap='223.6.6.6:53'
+"$UCI_BIN" -q delete dnsproxy.servers.upstream || true
+"$UCI_BIN" -q add_list dnsproxy.servers.upstream='https://dns.alidns.com/dns-query'
+
+"$UCI_BIN" -q set system.ntp=timeserver
+"$UCI_BIN" -q set system.ntp.enabled='1'
+"$UCI_BIN" -q set system.ntp.enable_server='0'
+"$UCI_BIN" -q delete system.ntp.server || true
+"$UCI_BIN" -q add_list system.ntp.server='162.159.200.1'
+"$UCI_BIN" -q add_list system.ntp.server='162.159.200.123'
+
+"$UCI_BIN" -q set firewall.dns_int=redirect
+"$UCI_BIN" -q set firewall.dns_int.name='Intercept-DNS'
+"$UCI_BIN" -q set firewall.dns_int.family='any'
+"$UCI_BIN" -q set firewall.dns_int.proto='tcp udp'
+"$UCI_BIN" -q set firewall.dns_int.src='lan'
+"$UCI_BIN" -q set firewall.dns_int.src_dport='53'
+"$UCI_BIN" -q set firewall.dns_int.target='DNAT'
+
+"$UCI_BIN" -q set firewall.dot_fwd=rule
+"$UCI_BIN" -q set firewall.dot_fwd.name='Deny-DoT'
+"$UCI_BIN" -q set firewall.dot_fwd.proto='tcp udp'
+"$UCI_BIN" -q set firewall.dot_fwd.src='lan'
+"$UCI_BIN" -q set firewall.dot_fwd.dest='wan'
+"$UCI_BIN" -q set firewall.dot_fwd.dest_port='853'
+"$UCI_BIN" -q set firewall.dot_fwd.target='REJECT'
+
+"$UCI_BIN" -q set portal-dns-guard.main.defaults_version="$DEFAULTS_VERSION"
+
+"$UCI_BIN" -q commit dhcp
+"$UCI_BIN" -q commit dnsproxy
+"$UCI_BIN" -q commit system
+"$UCI_BIN" -q commit firewall
+"$UCI_BIN" -q commit portal-dns-guard
+
+exit 0

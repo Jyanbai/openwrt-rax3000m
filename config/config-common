@@ -194,6 +194,7 @@ CONFIG_first_card_name="MT7981"
 ### Utilities
 CONFIG_PACKAGE_dnsmasq-full=y
 # CONFIG_PACKAGE_dnsmasq is not set
+CONFIG_PACKAGE_portal-dns-guard=y
 CONFIG_PACKAGE_luci-app-firewall=y
 CONFIG_PACKAGE_bash=y
 CONFIG_PACKAGE_automount=y
