@@ -74,7 +74,7 @@ fixture_get() {
 	local key="$1"
 	local fallback="$2"
 	local value
-	value="$(sed -n "s/^[[:space:]]*option[[:space:]][[:space:]]*$key[[:space:]][[:space:]]*'\([^']*\)'[[:space:]]*$/\1/p" "$PORTAL_DNS_TEST_UCI_FIXTURE" | head -n 1)"
+	value="$(sed -n "s/^[[:space:]]*option[[:space:]][[:space:]]*${key}[[:space:]][[:space:]]*'\([^']*\)'[[:space:]]*$/\1/p" "$PORTAL_DNS_TEST_UCI_FIXTURE" | head -n 1)"
 	printf '%s\n' "${value:-$fallback}"
 }
 
