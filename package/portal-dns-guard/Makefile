@@ -4,7 +4,6 @@ PKG_NAME:=portal-dns-guard
 PKG_VERSION:=1.0.0
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
-PKGARCH:=all
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -12,6 +11,7 @@ define Package/portal-dns-guard
   SECTION:=net
   CATEGORY:=Network
   TITLE:=Captive-portal-aware dnsmasq upstream controller
+  PKGARCH:=all
   DEPENDS:=+dnsmasq-full +dnsproxy +bind-dig +jsonfilter +ubus +uclient-fetch +ca-bundle
 endef
 
