@@ -20,6 +20,12 @@ define Package/portal-dns-guard/description
   WAN-DNS grace window for captive portal authentication.
 endef
 
+define Build/Configure
+endef
+
+define Build/Compile
+endef
+
 define Package/portal-dns-guard/conffiles
 /etc/config/portal-dns-guard
 endef
