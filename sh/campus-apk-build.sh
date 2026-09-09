@@ -70,7 +70,6 @@ validate_portal_dns_guard_apk() {
     --destination "$extract_dir" --no-chown "${candidates[0]}"
 
   python3 - "$metadata" "$scripts" <<'PY'
-import base64
 import json
 import re
 import sys
@@ -133,21 +132,29 @@ if len(maps) != 1:
     raise SystemExit(f"expected one APK scripts record, got {len(maps)}")
 script_map = maps[0]
 
-def script_value(*names):
-    for name in names:
-        value = script_map.get(name)
-        if isinstance(value, str) and value:
-            try:
-                return base64.b64decode(value, validate=True).decode("utf-8")
-            except (ValueError, UnicodeDecodeError) as exc:
-                raise SystemExit(f"invalid encoded APK script {name}: {exc}") from exc
-    raise SystemExit(f"missing APK script metadata: {names}")
+def script_value(scripts, name):
+    if name not in scripts:
+        raise SystemExit(f"missing APK script {name}")
+    value = scripts[name]
+    if not isinstance(value, str):
+        raise SystemExit(
+            f"invalid APK script {name}: expected string, "
+            f"got {type(value).__name__}"
+        )
+    if not value:
+        raise SystemExit(f"empty APK script {name}")
+    return value
 
-post_install = script_value("postinst", "post-install")
-post_upgrade = script_value("postupgrade", "post-upgrade")
-for name, content in (("post-install", post_install), ("post-upgrade", post_upgrade)):
-    if "default_postinst" not in content:
-        raise SystemExit(f"{name} does not invoke OpenWrt default_postinst")
+def require_script_line(name, content, line):
+    if line not in content.splitlines():
+        raise SystemExit(f"{name} is missing required line: {line}")
+
+post_install = script_value(script_map, "post-install")
+post_upgrade = script_value(script_map, "post-upgrade")
+for line in ("#!/bin/sh", 'export pkgname="portal-dns-guard"', "default_postinst"):
+    require_script_line("post-install", post_install, line)
+for line in ("export PKG_UPGRADE=1", "default_postinst"):
+    require_script_line("post-upgrade", post_upgrade, line)
 with open(sys.argv[2], "w", encoding="utf-8") as output:
     output.write("post-install: default_postinst present\n")
     output.write("post-upgrade: default_postinst present\n")
@@ -371,6 +378,7 @@ mkdir -p "$(dirname "$OPENWRT_ROOT")" "$CI_AUDIT_DIR"
   sh "$WORKSPACE/tests/defaults-test.sh"
   sh "$WORKSPACE/tests/dnsmasq-jail-mount-test.sh"
   sh "$WORKSPACE/tests/startup-order-test.sh"
+  python3 "$WORKSPACE/tests/apk-validator-test.py"
 } 2>&1 | tee "$CI_AUDIT_DIR/fixture-tests.log"
 
 set +e
