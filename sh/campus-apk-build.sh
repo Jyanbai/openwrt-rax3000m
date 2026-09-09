@@ -19,6 +19,8 @@ KERNEL_LINUX_DIR=""
 KERNEL_LINUX_VERSION=""
 KERNEL_VERMAGIC=""
 KERNEL_RELEASE=""
+GATE_BLOCKED=0
+GATE_FAILED=0
 
 fail() {
   echo "::error::$*" >&2
@@ -29,6 +31,191 @@ run_make() {
   local target="$1"
   echo "Building OpenWrt target: ${target}"
   make -j"$(nproc)" "$target" || make -j1 "$target" V=s
+}
+
+run_make_verbose_logged() {
+  local target="$1"
+  local log_file="$2"
+  echo "Building OpenWrt target with verbose logging: ${target}"
+  {
+    make -j"$(nproc)" "$target" V=s || make -j1 "$target" V=s
+  } 2>&1 | tee "$log_file"
+}
+
+validate_portal_dns_guard_apk() {
+  local apk_tool="$1"
+  local state_dir="$2"
+  local artifact_dir="$3"
+  local extract_dir="${state_dir}/portal-dns-guard-apk"
+  local metadata="${state_dir}/portal-dns-guard-apk-metadata.json"
+  local manifest="${state_dir}/portal-dns-guard-apk-manifest.txt"
+  local modes="${state_dir}/portal-dns-guard-apk-modes.txt"
+  local scripts="${state_dir}/portal-dns-guard-apk-scripts.txt"
+  local conffiles
+  local -a candidates expected_files
+
+  mapfile -t candidates < <(find bin -type f -name 'portal-dns-guard-*.apk' -print | sort)
+  (( ${#candidates[@]} == 1 )) || {
+    printf 'portal-dns-guard APK candidates:\n%s\n' "${candidates[*]:-none}" >&2
+    fail "Expected exactly one portal-dns-guard APK"
+  }
+
+  rm -rf "$extract_dir"
+  mkdir -p "$extract_dir"
+  "$apk_tool" adbdump --format json "${candidates[0]}" > "$metadata"
+  # Individual package payloads are intentionally unsigned; trust is supplied
+  # by the signed packages.adb index.  Extraction is a local content audit, so
+  # allow that expected state explicitly instead of depending on host keyrings.
+  "$apk_tool" --allow-untrusted extract \
+    --destination "$extract_dir" --no-chown "${candidates[0]}"
+
+  python3 - "$metadata" "$scripts" <<'PY'
+import base64
+import json
+import re
+import sys
+
+def records(value):
+    if isinstance(value, list):
+        return [record for item in value for record in records(item)]
+    if isinstance(value, dict):
+        if "name" in value:
+            return [value]
+        if isinstance(value.get("info"), dict) and "name" in value["info"]:
+            return [value["info"]]
+        if isinstance(value.get("packages"), list):
+            return [record for item in value["packages"] for record in records(item)]
+    return []
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    payload = json.load(source)
+    found = records(payload)
+if len(found) != 1:
+    raise SystemExit(f"expected one APK metadata record, got {len(found)}")
+record = found[0]
+if record.get("name") != "portal-dns-guard":
+    raise SystemExit(f"wrong package name: {record.get('name')!r}")
+if not str(record.get("version", "")).startswith("1.0.0-"):
+    raise SystemExit(f"wrong package version: {record.get('version')!r}")
+architecture = record.get("arch", record.get("architecture"))
+if architecture not in {"noarch", "all"}:
+    raise SystemExit(f"wrong package architecture: {architecture!r}")
+depends = record.get("depends")
+if not isinstance(depends, list):
+    raise SystemExit(f"APK dependency metadata is not a list: {depends!r}")
+def dependency_name(item):
+    if isinstance(item, dict) and item.get("name"):
+        return str(item["name"])
+    if isinstance(item, str):
+        return re.split(r"[<>=~\s]", item.strip(), maxsplit=1)[0]
+    raise SystemExit(f"unsupported APK dependency metadata: {item!r}")
+
+dependency_names = {dependency_name(item) for item in depends}
+for dependency in ("dnsmasq-full", "dnsproxy", "bind-dig", "jsonfilter", "ubus", "uclient-fetch", "ca-bundle"):
+    if dependency not in dependency_names:
+        raise SystemExit(f"missing APK dependency metadata: {dependency}")
+
+def script_maps(value):
+    if isinstance(value, list):
+        return [found for item in value for found in script_maps(item)]
+    if isinstance(value, dict):
+        result = []
+        if isinstance(value.get("scripts"), dict):
+            result.append(value["scripts"])
+        for key, item in value.items():
+            if key != "scripts":
+                result.extend(script_maps(item))
+        return result
+    return []
+
+maps = script_maps(payload)
+if len(maps) != 1:
+    raise SystemExit(f"expected one APK scripts record, got {len(maps)}")
+script_map = maps[0]
+
+def script_value(*names):
+    for name in names:
+        value = script_map.get(name)
+        if isinstance(value, str) and value:
+            try:
+                return base64.b64decode(value, validate=True).decode("utf-8")
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise SystemExit(f"invalid encoded APK script {name}: {exc}") from exc
+    raise SystemExit(f"missing APK script metadata: {names}")
+
+post_install = script_value("postinst", "post-install")
+post_upgrade = script_value("postupgrade", "post-upgrade")
+for name, content in (("post-install", post_install), ("post-upgrade", post_upgrade)):
+    if "default_postinst" not in content:
+        raise SystemExit(f"{name} does not invoke OpenWrt default_postinst")
+with open(sys.argv[2], "w", encoding="utf-8") as output:
+    output.write("post-install: default_postinst present\n")
+    output.write("post-upgrade: default_postinst present\n")
+PY
+
+  expected_files=(
+    etc/config/portal-dns-guard
+    etc/init.d/portal-dns-guard
+    etc/hotplug.d/iface/95-portal-dns-guard
+    etc/uci-defaults/99-portal-dns-guard
+    usr/sbin/portal-dns-guard
+  )
+  for file in "${expected_files[@]}"; do
+    [[ -f "${extract_dir}/${file}" ]] || fail "APK payload is missing /${file}"
+  done
+
+  [[ "$(stat -c '%a' "${extract_dir}/etc/config/portal-dns-guard")" == 600 ]] ||
+    fail "APK UCI config mode is not 0600"
+  for file in \
+    etc/init.d/portal-dns-guard \
+    etc/hotplug.d/iface/95-portal-dns-guard \
+    etc/uci-defaults/99-portal-dns-guard \
+    usr/sbin/portal-dns-guard; do
+    [[ "$(stat -c '%a' "${extract_dir}/${file}")" == 755 ]] ||
+      fail "APK executable mode is not 0755: /${file}"
+  done
+
+  sh -n \
+    "${extract_dir}/etc/init.d/portal-dns-guard" \
+    "${extract_dir}/etc/hotplug.d/iface/95-portal-dns-guard" \
+    "${extract_dir}/etc/uci-defaults/99-portal-dns-guard" \
+    "${extract_dir}/usr/sbin/portal-dns-guard"
+  grep -Fq "delete 'dhcp.@dnsmasq[0].serversfile'" \
+    "${extract_dir}/etc/uci-defaults/99-portal-dns-guard" || \
+    fail "APK defaults retained the stale child-mount configuration"
+  grep -Fq 'servers-file=$MANAGED_SERVERS_FILE' \
+    "${extract_dir}/etc/uci-defaults/99-portal-dns-guard" || \
+    fail "APK defaults do not emit the managed servers-file through extraconftext"
+
+  conffiles="${extract_dir}/lib/apk/packages/portal-dns-guard.conffiles"
+  [[ -f "$conffiles" ]] || fail "APK payload lacks its conffiles declaration"
+  grep -Fqx '/etc/config/portal-dns-guard' "$conffiles" || \
+    fail "APK does not preserve /etc/config/portal-dns-guard"
+
+  (
+    cd "$extract_dir"
+    find . -type f -printf '%P\n' | sort
+  ) > "$manifest"
+  (
+    cd "$extract_dir"
+    find . -type f -printf '%m %P\n' | sort -k2
+  ) > "$modes"
+  if grep -Ei '(^|/)(tests?|fixtures?)(/|$)' "$manifest"; then
+    fail "APK payload unexpectedly contains tests or fixtures"
+  fi
+  if grep -Ei '(^|/)readme([./]|$)' "$manifest"; then
+    fail "APK payload unexpectedly contains the source-only README"
+  fi
+  if grep -Ei '(^|/)(id_(rsa|dsa|ecdsa|ed25519)|.*\.key|.*private.*)$' "$manifest"; then
+    fail "APK payload unexpectedly contains a private-key-like file"
+  fi
+  if grep -RIlE -- '-----BEGIN ([A-Z0-9 ]+ )?PRIVATE KEY-----' "$extract_dir"; then
+    fail "APK payload unexpectedly contains private key material"
+  fi
+  mkdir -p "$artifact_dir"
+  cp -a "${candidates[0]}" "$artifact_dir/"
+  sha256sum "${candidates[0]}" > "${state_dir}/portal-dns-guard-apk-sha256.txt"
+  printf 'Validated portal-dns-guard APK: %s\n' "${candidates[0]}"
 }
 
 config_state() {
@@ -148,10 +335,72 @@ readonly WORKSPACE="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
 readonly OPENWRT_ROOT="${OPENWRT_ROOT:-/workdir/openwrt}"
 readonly OUT_DIR="${WORKSPACE}/out"
 readonly STATE_DIR="${OPENWRT_ROOT}/.campus-apk-state"
+readonly CI_AUDIT_DIR="${OUT_DIR}/portal-dns-guard-ci"
 
 [[ ! -e "$OPENWRT_ROOT" ]] || fail "Refusing to overwrite existing OPENWRT_ROOT: $OPENWRT_ROOT"
 rm -rf "$OUT_DIR"
-mkdir -p "$(dirname "$OPENWRT_ROOT")" "$OUT_DIR"
+mkdir -p "$(dirname "$OPENWRT_ROOT")" "$CI_AUDIT_DIR"
+
+{
+  for script in \
+    "$WORKSPACE"/package/portal-dns-guard/files/*.sh \
+    "$WORKSPACE"/package/portal-dns-guard/files/*.init \
+    "$WORKSPACE"/package/portal-dns-guard/files/*.hotplug \
+    "$WORKSPACE"/tests/*.sh \
+    "$WORKSPACE"/tests/fixtures/*.sh; do
+    sh -n "$script"
+  done
+  printf 'PASS: shell syntax\n'
+} 2>&1 | tee "$CI_AUDIT_DIR/shell-syntax.log"
+
+{
+  shellcheck --severity=error --shell=dash \
+    "$WORKSPACE"/package/portal-dns-guard/files/*.sh \
+    "$WORKSPACE"/package/portal-dns-guard/files/*.init \
+    "$WORKSPACE"/package/portal-dns-guard/files/*.hotplug \
+    "$WORKSPACE"/tests/*.sh \
+    "$WORKSPACE"/tests/fixtures/*.sh
+  shellcheck --severity=error --shell=bash \
+    "$WORKSPACE/sh/campus-apk-build.sh" \
+    "$WORKSPACE/sh/op.sh"
+  printf 'PASS: ShellCheck severity=error\n'
+} 2>&1 | tee "$CI_AUDIT_DIR/shellcheck.log"
+
+{
+  sh "$WORKSPACE/tests/portal-dns-guard-test.sh"
+  sh "$WORKSPACE/tests/defaults-test.sh"
+  sh "$WORKSPACE/tests/dnsmasq-jail-mount-test.sh"
+  sh "$WORKSPACE/tests/startup-order-test.sh"
+} 2>&1 | tee "$CI_AUDIT_DIR/fixture-tests.log"
+
+set +e
+sh "$WORKSPACE/tests/dnsmasq-failclosed-test.sh" \
+  2>&1 | tee "$CI_AUDIT_DIR/dnsmasq-failclosed.log"
+dnsmasq_test_rc=${PIPESTATUS[0]}
+set -e
+case "$dnsmasq_test_rc" in
+  0) printf 'PASS\n' > "$CI_AUDIT_DIR/dnsmasq-failclosed.status" ;;
+  77)
+    printf 'BLOCKED: host dnsmasq or dig unavailable\n' > "$CI_AUDIT_DIR/dnsmasq-failclosed.status"
+    GATE_BLOCKED=1
+    ;;
+  *) fail "real dnsmasq fail-closed integration test failed with rc=${dnsmasq_test_rc}" ;;
+esac
+
+set +e
+sudo sh "$WORKSPACE/tests/ujail-atomic-rename-test.sh" \
+  2>&1 | tee "$CI_AUDIT_DIR/bind-mount-atomic-rename.log"
+mount_test_rc=${PIPESTATUS[0]}
+set -e
+case "$mount_test_rc" in
+  0) printf 'PASS\n' > "$CI_AUDIT_DIR/bind-mount-atomic-rename.status" ;;
+  77)
+    printf 'BLOCKED: runner cannot provide an isolated mount namespace\n' > \
+      "$CI_AUDIT_DIR/bind-mount-atomic-rename.status"
+    GATE_BLOCKED=1
+    ;;
+  *) fail "bind-mount atomic-rename test failed with rc=${mount_test_rc}" ;;
+esac
 
 git clone --filter=blob:none --no-checkout "$OPENWRT_REPO" "$OPENWRT_ROOT"
 git -C "$OPENWRT_ROOT" fetch --force --depth=1 origin "$OPENWRT_COMMIT"
@@ -182,9 +431,16 @@ git -C "$OPENWRT_ROOT" checkout --detach "$OPENWRT_COMMIT"
 grep -Eq '^[[:space:]]*([^#[:space:]]+[[:space:]]+)*dtb:[[:space:]]*FORCE([[:space:]]|$)' \
   "$OPENWRT_ROOT/target/linux/Makefile" || \
   fail "Pinned target/linux/Makefile does not expose dtb as a public target"
+OPENWRT_SOURCE_ROOT="$OPENWRT_ROOT" \
+  sh "$WORKSPACE/tests/dnsmasq-jail-mount-test.sh" \
+  2>&1 | tee "$CI_AUDIT_DIR/openwrt-exact-source.log"
 
 cd "$OPENWRT_ROOT"
 ./scripts/feeds update -a
+OPENWRT_SOURCE_ROOT="$OPENWRT_ROOT" \
+OPENWRT_PACKAGES_ROOT="$OPENWRT_ROOT/feeds/packages" \
+  sh "$WORKSPACE/tests/startup-order-test.sh" \
+  2>&1 | tee "$CI_AUDIT_DIR/openwrt-exact-startup-order.log"
 
 cp -a "$WORKSPACE"/patch/diy/*.patch "$OPENWRT_ROOT"/
 cp -a "$WORKSPACE"/patch/luci/*.patch "$OPENWRT_ROOT"/feeds/luci/
@@ -215,8 +471,8 @@ git -C package/rkp-ipid checkout --detach "$RKP_IPID_COMMIT"
 [[ "$(git -C package/rkp-ipid rev-parse HEAD)" == "$RKP_IPID_COMMIT" ]] || \
   fail "rkp-ipid checkout is not the pinned upstream commit"
 
-# sh/op.sh intentionally remains unchanged. It provides a custom xray-core,
-# so replace only that package in this ephemeral tree with the exact official
+# sh/op.sh provides the local package overlays and a custom xray-core, so
+# replace only xray-core in this ephemeral tree with the exact official
 # packages-feed recipe pinned by feeds.conf.default.
 rm -rf package/porxy/xray-core package/feeds/packages/xray-core
 ./scripts/feeds install -f -p packages xray-core
@@ -295,6 +551,8 @@ for symbol in ua2f kmod-rkp-ipid xray-core; do
   grep -Fqx "CONFIG_PACKAGE_${symbol}=m" .config || \
     fail "CONFIG_PACKAGE_${symbol}=m was silently disabled or changed"
 done
+grep -Fqx 'CONFIG_PACKAGE_portal-dns-guard=y' .config || \
+  fail "CONFIG_PACKAGE_portal-dns-guard=y was silently disabled or changed"
 
 [[ "$(config_state .config CONFIG_TARGET_ARCH_PACKAGES)" == '"aarch64_cortex-a53"' ]] || \
   fail "Final package architecture is not ${EXPECTED_ARCH}"
@@ -334,9 +592,14 @@ run_make target/linux/compile
 run_make package/UA2F/openwrt/compile
 run_make package/rkp-ipid/compile
 run_make package/feeds/packages/xray-core/compile
+run_make_verbose_logged package/portal-dns-guard/clean \
+  "$CI_AUDIT_DIR/portal-dns-guard-package-clean.log"
+run_make_verbose_logged package/portal-dns-guard/compile \
+  "$CI_AUDIT_DIR/portal-dns-guard-package-compile.log"
 
 apk_tool="$OPENWRT_ROOT/staging_dir/host/bin/apk"
 [[ -x "$apk_tool" ]] || fail "OpenWrt host apk tool is missing"
+validate_portal_dns_guard_apk "$apk_tool" "$STATE_DIR" "$OUT_DIR"
 
 python3 "$WORKSPACE/sh/campus-apk-bundle.py" \
   --source-root "$OPENWRT_ROOT" \
@@ -360,6 +623,54 @@ python3 "$WORKSPACE/sh/campus-apk-bundle.py" \
   --xray-version "$xray_version" \
   --public-key "$OPENWRT_ROOT/public-key.pem" \
   --kernel-config-diff "$STATE_DIR/kernel-config.diff"
+
+mkdir -p "$OUT_DIR/portal-dns-guard-audit"
+cp -a \
+  "$STATE_DIR/portal-dns-guard-apk-metadata.json" \
+  "$STATE_DIR/portal-dns-guard-apk-manifest.txt" \
+  "$STATE_DIR/portal-dns-guard-apk-modes.txt" \
+  "$STATE_DIR/portal-dns-guard-apk-scripts.txt" \
+  "$STATE_DIR/portal-dns-guard-apk-sha256.txt" \
+  "$OUT_DIR/portal-dns-guard-audit/"
+
+grep -E \
+  '^(CONFIG_TARGET_mediatek|CONFIG_TARGET_mediatek_filogic|CONFIG_TARGET_mediatek_filogic_DEVICE_cmcc_rax3000m-emmc|CONFIG_PACKAGE_(portal-dns-guard|dnsmasq|dnsmasq-full|dnsproxy|bind-dig|jsonfilter|ubus|uclient-fetch|ca-bundle))=' \
+  .config | sort > "$CI_AUDIT_DIR/final-config-relevant.txt"
+
+# Attempt the repository's complete target/image build, but bound the extra
+# work so a hosted runner can still upload package and test evidence.  A
+# timeout or resource exhaustion is reported as BLOCKED, never as PASS.
+set +e
+timeout --signal=TERM --kill-after=5m 90m \
+  bash -Eeuo pipefail -c 'make -j"$(nproc)" || make -j1 V=s' \
+  2>&1 | tee "$CI_AUDIT_DIR/full-image-build.log"
+image_build_rc=${PIPESTATUS[0]}
+set -e
+case "$image_build_rc" in
+  0)
+    printf 'PASS\n' > "$CI_AUDIT_DIR/full-image-build.status"
+    mkdir -p "$OUT_DIR/non-production-image"
+    find bin/targets/mediatek/filogic -maxdepth 1 -type f \
+      \( -name '*rax3000m*' -o -name '*.manifest' -o -name 'sha256sums' \) \
+      -exec cp -a {} "$OUT_DIR/non-production-image/" \;
+    ;;
+  124|137)
+    printf 'BLOCKED_BY_CI_RESOURCE: rc=%s\n' "$image_build_rc" > \
+      "$CI_AUDIT_DIR/full-image-build.status"
+    GATE_BLOCKED=1
+    ;;
+  *)
+    if grep -Eqi 'no space left on device|cannot allocate memory|out of memory' \
+      "$CI_AUDIT_DIR/full-image-build.log"; then
+      printf 'BLOCKED_BY_CI_RESOURCE: rc=%s\n' "$image_build_rc" > \
+        "$CI_AUDIT_DIR/full-image-build.status"
+      GATE_BLOCKED=1
+    else
+      printf 'FAIL: rc=%s\n' "$image_build_rc" > "$CI_AUDIT_DIR/full-image-build.status"
+      GATE_FAILED=1
+    fi
+    ;;
+esac
 
 # Reuse the original repository's signing helper and EC key. It signs APK
 # repository indexes; the private key is intentionally never copied to out/.
@@ -393,6 +704,7 @@ EOF
 )
 
 for required in \
+  "$OUT_DIR"/portal-dns-guard-*.apk \
   "$OUT_DIR"/ua2f*.apk \
   "$OUT_DIR"/kmod-rkp-ipid*.apk \
   "$OUT_DIR"/xray-core*.apk \
@@ -408,3 +720,6 @@ done
 
 echo "Validated artifact directory: $OUT_DIR"
 find "$OUT_DIR" -maxdepth 2 -type f -printf '%P\n' | sort
+
+[[ "$GATE_FAILED" -eq 0 ]] || fail "one or more Linux/OpenWrt gates failed"
+[[ "$GATE_BLOCKED" -eq 0 ]] || fail "one or more Linux/OpenWrt gates are blocked"
