@@ -71,6 +71,9 @@ printf 'NOT_EXECUTED: full image build has not passed\n' > \
   printf 'make_world_exit=NOT_EXECUTED\n'
 } > "$OUT_DIR/build-info.txt"
 
+bash "$WORKSPACE/tests/campus-image-config-check-test.sh" 2>&1 |
+  tee "$OUT_DIR/target-config-regression.log"
+
 git clone --filter=blob:none --no-checkout "$OPENWRT_REPO" "$OPENWRT_ROOT"
 git -C "$OPENWRT_ROOT" fetch --force --depth=1 origin "$OPENWRT_COMMIT"
 git -C "$OPENWRT_ROOT" fetch --force --depth=1 origin \
@@ -142,21 +145,20 @@ fi
   printf '%s\n' \
     'CONFIG_TARGET_mediatek=y' \
     'CONFIG_TARGET_mediatek_filogic=y' \
-    'CONFIG_TARGET_mediatek_filogic_DEVICE_cmcc_rax3000m-emmc=y'
+    'CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_cmcc_rax3000m-emmc=y'
   cat "$WORKSPACE/config/config-apk"
 } > .config
 
 make defconfig
-require_config CONFIG_TARGET_mediatek y
-require_config CONFIG_TARGET_mediatek_filogic y
-require_config CONFIG_TARGET_mediatek_filogic_DEVICE_cmcc_rax3000m-emmc y
+bash "$WORKSPACE/sh/campus-image-config-check.sh" .config 2>&1 |
+  tee "$OUT_DIR/final-config-check.log"
 require_config CONFIG_PACKAGE_portal-dns-guard y
 require_config CONFIG_PACKAGE_dnsproxy y
 require_config CONFIG_PACKAGE_dnsmasq-full y
 require_config CONFIG_PACKAGE_firewall4 y
 
 grep -E \
-  '^(CONFIG_TARGET_mediatek|CONFIG_TARGET_mediatek_filogic|CONFIG_TARGET_mediatek_filogic_DEVICE_cmcc_rax3000m-emmc|CONFIG_PACKAGE_(portal-dns-guard|dnsmasq|dnsmasq-full|dnsproxy|firewall4))=' \
+  '^(CONFIG_TARGET_mediatek|CONFIG_TARGET_mediatek_filogic|CONFIG_TARGET_MULTI_PROFILE|CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_cmcc_rax3000m-emmc|CONFIG_PACKAGE_(portal-dns-guard|dnsmasq|dnsmasq-full|dnsproxy|firewall4))=' \
   .config | sort > "$OUT_DIR/final-config-relevant.txt"
 
 mapfile -t undersized_downloads < <(find "$DL_CACHE" -type f -size -1024c -print)
@@ -191,11 +193,10 @@ target_dir="bin/targets/${TARGET}/${SUBTARGET}"
 [[ -d "$target_dir" ]] || fail "Target output directory is missing: $target_dir"
 
 mapfile -t images < <(
-  find "$target_dir" -maxdepth 1 -type f -name '*rax3000m-emmc*' \
-    ! -name '*.manifest' ! -name '*.buildinfo' ! -name '*.json' \
-    ! -name '*.sha' -print | sort
+  find "$target_dir" -maxdepth 1 -type f \
+    -name '*rax3000m-emmc*-sysupgrade.bin' -print | sort
 )
-(( ${#images[@]} > 0 )) || fail "No RAX3000M eMMC firmware image was produced"
+(( ${#images[@]} > 0 )) || fail "No RAX3000M eMMC sysupgrade.bin was produced"
 
 mapfile -t manifests < <(
   find "$target_dir" -maxdepth 1 -type f -name '*rax3000m-emmc*.manifest' \
@@ -248,7 +249,7 @@ fi
 
 printf '%s\n' \
   'PASS: make world exited 0' \
-  'PASS: RAX3000M eMMC firmware image exists' \
+  'PASS: RAX3000M eMMC sysupgrade.bin exists' \
   'PASS: image manifest and sha256sums exist' \
   'PASS: portal-dns-guard, dnsproxy, dnsmasq-full, and firewall4 are in the image manifest' \
   'NOT_EXECUTED: procd, ujail, generated dnsmasq config, and Portal transitions require a booted canary' \
