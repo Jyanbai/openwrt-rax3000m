@@ -33,14 +33,6 @@ require_config() {
     fail "Final config does not contain ${symbol}=${expected}"
 }
 
-require_manifest_package() {
-  local package="$1"
-  shift
-
-  grep -hEq "^${package}([[:space:]]|$)" "$@" ||
-    fail "Image manifest is missing required package: ${package}"
-}
-
 [[ "${GITHUB_ACTIONS:-}" == "true" ]] ||
   fail "campus-image-build.sh is intentionally restricted to GitHub Actions"
 
@@ -48,7 +40,7 @@ readonly WORKSPACE="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
 readonly OPENWRT_ROOT="${OPENWRT_ROOT:-/workdir/openwrt}"
 readonly DL_CACHE="${OPENWRT_DL_CACHE:-/workdir/openwrt-dl}"
 readonly OUT_DIR="${WORKSPACE}/full-image-out"
-readonly FIRMWARE_DIR="${OUT_DIR}/firmware"
+readonly ARTIFACT_TARGET_DIR="${OUT_DIR}/bin/targets/${TARGET}/${SUBTARGET}"
 
 [[ ! -e "$OPENWRT_ROOT" ]] ||
   fail "Refusing to overwrite existing OPENWRT_ROOT: $OPENWRT_ROOT"
@@ -60,7 +52,7 @@ mkdir -p "$(dirname "$OPENWRT_ROOT")" "$DL_CACHE" "$OUT_DIR"
 printf 'NOT_EXECUTED: image preparation has not completed\n' > \
   "$OUT_DIR/full-image-build.status"
 printf 'NOT_EXECUTED: full image build has not passed\n' > \
-  "$OUT_DIR/static-image-inspection.status"
+  "$OUT_DIR/binary-evidence-retention.status"
 {
   printf 'openwrt_repo=%s\n' "$OPENWRT_REPO"
   printf 'openwrt_tag=%s\n' "$OPENWRT_TAG"
@@ -186,55 +178,6 @@ if (( image_build_rc != 0 )); then
   fail "full target/image build failed with rc=${image_build_rc}"
 fi
 printf 'PASS\n' > "$CURRENT_STATUS_FILE"
-CURRENT_STATUS_FILE="$OUT_DIR/static-image-inspection.status"
-printf 'RUNNING\n' > "$CURRENT_STATUS_FILE"
-
-target_dir="bin/targets/${TARGET}/${SUBTARGET}"
-[[ -d "$target_dir" ]] || fail "Target output directory is missing: $target_dir"
-
-mapfile -t images < <(
-  find "$target_dir" -maxdepth 1 -type f \
-    -name '*rax3000m-emmc*-sysupgrade.bin' -print | sort
-)
-(( ${#images[@]} > 0 )) || fail "No RAX3000M eMMC sysupgrade.bin was produced"
-
-mapfile -t manifests < <(
-  find "$target_dir" -maxdepth 1 -type f -name '*rax3000m-emmc*.manifest' \
-    -print | sort
-)
-(( ${#manifests[@]} > 0 )) || fail "No RAX3000M eMMC image manifest was produced"
-[[ -f "$target_dir/sha256sums" ]] || fail "Target sha256sums is missing"
-
-require_manifest_package portal-dns-guard "${manifests[@]}"
-require_manifest_package dnsproxy "${manifests[@]}"
-require_manifest_package dnsmasq-full "${manifests[@]}"
-require_manifest_package firewall4 "${manifests[@]}"
-printf '%s\n' \
-  'PASS: portal-dns-guard is in the image manifest' \
-  'PASS: dnsproxy is in the image manifest' \
-  'PASS: dnsmasq-full is in the image manifest' \
-  'PASS: firewall4 is in the image manifest' \
-  > "$OUT_DIR/image-package-manifest-check.txt"
-
-(
-  cd "$target_dir"
-  sha256sum -c sha256sums
-) 2>&1 | tee "$OUT_DIR/image-sha256-verification.log"
-
-mkdir -p "$FIRMWARE_DIR"
-cp -a "${images[@]}" "${manifests[@]}" "$FIRMWARE_DIR/"
-cp -a "$target_dir/sha256sums" "$OUT_DIR/target-sha256sums"
-if [[ -f "$target_dir/profiles.json" ]]; then
-  cp -a "$target_dir/profiles.json" "$FIRMWARE_DIR/"
-fi
-
-(
-  cd "$FIRMWARE_DIR"
-  find . -maxdepth 1 -type f ! -name sha256sums -print0 | sort -z |
-    xargs -0 sha256sum > sha256sums
-  sha256sum -c sha256sums
-) 2>&1 | tee "$OUT_DIR/firmware-sha256-verification.log"
-
 {
   printf 'openwrt_repo=%s\n' "$OPENWRT_REPO"
   printf 'openwrt_tag=%s\n' "$OPENWRT_TAG"
@@ -247,23 +190,21 @@ fi
   printf 'runtime_inspection=NOT_EXECUTED; reserved for non-production canary\n'
 } > "$OUT_DIR/build-info.txt"
 
-printf '%s\n' \
-  'PASS: make world exited 0' \
-  'PASS: RAX3000M eMMC sysupgrade.bin exists' \
-  'PASS: image manifest and sha256sums exist' \
-  'PASS: portal-dns-guard, dnsproxy, dnsmasq-full, and firewall4 are in the image manifest' \
-  'NOT_EXECUTED: procd, ujail, generated dnsmasq config, and Portal transitions require a booted canary' \
-  > "$OUT_DIR/static-image-inspection.txt"
+CURRENT_STATUS_FILE="$OUT_DIR/binary-evidence-retention.status"
+printf 'RUNNING\n' > "$CURRENT_STATUS_FILE"
 
-(
-  cd "$OUT_DIR"
-  find . -type f ! -name ARTIFACT-SHA256SUMS -print0 | sort -z |
-    xargs -0 sha256sum > ARTIFACT-SHA256SUMS
-  sha256sum -c ARTIFACT-SHA256SUMS
-)
+target_dir="bin/targets/${TARGET}/${SUBTARGET}"
+[[ -d "$target_dir" ]] || fail "Target output directory is missing: $target_dir"
+
+mkdir -p "$ARTIFACT_TARGET_DIR"
+cp -a "$target_dir"/. "$ARTIFACT_TARGET_DIR"/
+cp -a .config "$OUT_DIR/final.config"
+find "$ARTIFACT_TARGET_DIR" -maxdepth 1 -type f \
+  -printf '%f\t%s\n' | sort > "$OUT_DIR/target-files.txt"
 
 printf 'PASS\n' > "$CURRENT_STATUS_FILE"
 CURRENT_STATUS_FILE=""
 
-echo "Validated full-image artifact directory: $OUT_DIR"
-find "$OUT_DIR" -maxdepth 2 -type f -printf '%P\n' | sort
+echo "Retained complete full-image artifact directory: $OUT_DIR"
+find "$OUT_DIR" -maxdepth 1 -type f -printf '%P\n' | sort
+printf 'Retained target files: %s\n' "$(wc -l < "$OUT_DIR/target-files.txt")"

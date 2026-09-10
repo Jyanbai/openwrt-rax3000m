@@ -2,12 +2,18 @@ name: RAX3000M 25.12.5 campus APKs
 
 on:
   workflow_dispatch:
+    inputs:
+      validation_artifact_run_id:
+        description: Optional successful build run ID for validation-only reuse
+        required: false
+        type: string
   push:
     branches:
       - 'ci/**'
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: rax3000m-25.12.5-campus-apk
@@ -16,6 +22,7 @@ concurrency:
 jobs:
   validate:
     name: Build and validate standalone APK bundle
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.validation_artifact_run_id == '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
 
@@ -58,9 +65,10 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  full_image:
-    name: Build and inspect full RAX3000M image
+  build_full_image:
+    name: Build full RAX3000M image
     needs: validate
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.validation_artifact_run_id == '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 350
 
@@ -93,7 +101,7 @@ jobs:
           restore-keys: |
             openwrt-dl-ubuntu-24.04-0e38877debc3b65b11b4b0589268d29c6b19404f-5caa62e0bc9f7fb9b0c12a23267bceb7724214dd-mediatek-filogic-
 
-      - name: Build and inspect full RAX3000M image
+      - name: Build and retain full RAX3000M image
         env:
           OPENWRT_ROOT: /workdir/openwrt
           OPENWRT_DL_CACHE: /workdir/openwrt-dl
@@ -107,7 +115,90 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rax3000m-25.12.5-full-image
+          name: rax3000m-25.12.5-full-image-${{ github.sha }}
           path: full-image-out/
+          if-no-files-found: error
+          retention-days: 14
+
+  validate_full_image:
+    name: Validate retained full RAX3000M image
+    needs: build_full_image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout validator source
+        uses: actions/checkout@v6
+
+      - name: Download full image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rax3000m-25.12.5-full-image-${{ github.sha }}
+          path: full-image-input
+
+      - name: Run offline validator fixtures
+        run: |
+          mkdir -p full-image-validation-out
+          python3 tests/campus-image-validator-test.py 2>&1 | \
+            tee full-image-validation-out/validator-fixtures.log
+
+      - name: Validate retained full image
+        run: |
+          python3 sh/campus-image-validate.py \
+            full-image-input \
+            --output-dir full-image-validation-out
+
+      - name: Upload full image validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rax3000m-25.12.5-image-validation-${{ github.sha }}
+          path: full-image-validation-out/
+          if-no-files-found: error
+          retention-days: 14
+
+  validate_retained_full_image:
+    name: Validate a retained full-image artifact only
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.validation_artifact_run_id != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout validator source
+        uses: actions/checkout@v6
+
+      - name: Download retained full image artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RUN_ID: ${{ inputs.validation_artifact_run_id }}
+        run: |
+          [[ "$BUILD_RUN_ID" =~ ^[0-9]+$ ]] || {
+            echo "::error::validation_artifact_run_id must be numeric"
+            exit 1
+          }
+          mkdir -p full-image-input
+          gh run download "$BUILD_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'rax3000m-25.12.5-full-image-*' \
+            --dir full-image-input
+
+      - name: Run offline validator fixtures
+        run: |
+          mkdir -p full-image-validation-out
+          python3 tests/campus-image-validator-test.py 2>&1 | \
+            tee full-image-validation-out/validator-fixtures.log
+
+      - name: Validate retained full image
+        run: |
+          python3 sh/campus-image-validate.py \
+            full-image-input \
+            --output-dir full-image-validation-out
+
+      - name: Upload full image validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rax3000m-25.12.5-revalidated-${{ inputs.validation_artifact_run_id }}-${{ github.run_id }}
+          path: full-image-validation-out/
           if-no-files-found: error
           retention-days: 14
