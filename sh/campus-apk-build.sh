@@ -20,7 +20,6 @@ KERNEL_LINUX_VERSION=""
 KERNEL_VERMAGIC=""
 KERNEL_RELEASE=""
 GATE_BLOCKED=0
-GATE_FAILED=0
 
 fail() {
   echo "::error::$*" >&2
@@ -369,6 +368,7 @@ mkdir -p "$(dirname "$OPENWRT_ROOT")" "$CI_AUDIT_DIR"
     "$WORKSPACE"/tests/fixtures/*.sh
   shellcheck --severity=error --shell=bash \
     "$WORKSPACE/sh/campus-apk-build.sh" \
+    "$WORKSPACE/sh/campus-image-build.sh" \
     "$WORKSPACE/sh/op.sh"
   printf 'PASS: ShellCheck severity=error\n'
 } 2>&1 | tee "$CI_AUDIT_DIR/shellcheck.log"
@@ -645,41 +645,6 @@ grep -E \
   '^(CONFIG_TARGET_mediatek|CONFIG_TARGET_mediatek_filogic|CONFIG_TARGET_mediatek_filogic_DEVICE_cmcc_rax3000m-emmc|CONFIG_PACKAGE_(portal-dns-guard|dnsmasq|dnsmasq-full|dnsproxy|bind-dig|jsonfilter|ubus|uclient-fetch|ca-bundle))=' \
   .config | sort > "$CI_AUDIT_DIR/final-config-relevant.txt"
 
-# Attempt the repository's complete target/image build, but bound the extra
-# work so a hosted runner can still upload package and test evidence.  A
-# timeout or resource exhaustion is reported as BLOCKED, never as PASS.
-set +e
-timeout --signal=TERM --kill-after=5m 90m \
-  bash -Eeuo pipefail -c 'make -j"$(nproc)" || make -j1 V=s' \
-  2>&1 | tee "$CI_AUDIT_DIR/full-image-build.log"
-image_build_rc=${PIPESTATUS[0]}
-set -e
-case "$image_build_rc" in
-  0)
-    printf 'PASS\n' > "$CI_AUDIT_DIR/full-image-build.status"
-    mkdir -p "$OUT_DIR/non-production-image"
-    find bin/targets/mediatek/filogic -maxdepth 1 -type f \
-      \( -name '*rax3000m*' -o -name '*.manifest' -o -name 'sha256sums' \) \
-      -exec cp -a {} "$OUT_DIR/non-production-image/" \;
-    ;;
-  124|137)
-    printf 'BLOCKED_BY_CI_RESOURCE: rc=%s\n' "$image_build_rc" > \
-      "$CI_AUDIT_DIR/full-image-build.status"
-    GATE_BLOCKED=1
-    ;;
-  *)
-    if grep -Eqi 'no space left on device|cannot allocate memory|out of memory' \
-      "$CI_AUDIT_DIR/full-image-build.log"; then
-      printf 'BLOCKED_BY_CI_RESOURCE: rc=%s\n' "$image_build_rc" > \
-        "$CI_AUDIT_DIR/full-image-build.status"
-      GATE_BLOCKED=1
-    else
-      printf 'FAIL: rc=%s\n' "$image_build_rc" > "$CI_AUDIT_DIR/full-image-build.status"
-      GATE_FAILED=1
-    fi
-    ;;
-esac
-
 # Reuse the original repository's signing helper and EC key. It signs APK
 # repository indexes; the private key is intentionally never copied to out/.
 bash "$OPENWRT_ROOT/kmod-sign" "$OUT_DIR"
@@ -729,5 +694,4 @@ done
 echo "Validated artifact directory: $OUT_DIR"
 find "$OUT_DIR" -maxdepth 2 -type f -printf '%P\n' | sort
 
-[[ "$GATE_FAILED" -eq 0 ]] || fail "one or more Linux/OpenWrt gates failed"
 [[ "$GATE_BLOCKED" -eq 0 ]] || fail "one or more Linux/OpenWrt gates are blocked"
