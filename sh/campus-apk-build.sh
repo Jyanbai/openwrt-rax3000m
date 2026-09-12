@@ -5,6 +5,7 @@ set -Eeuo pipefail
 readonly OPENWRT_REPO="https://github.com/shiyu1314/openwrt-source.git"
 readonly OPENWRT_TAG="v25.12.5"
 readonly OPENWRT_COMMIT="0e38877debc3b65b11b4b0589268d29c6b19404f"
+readonly EXPECTED_OPENWRT_TREE="dec27f1d40a4c5de175cdc70392fc6571c971552"
 readonly UA2F_REPO="https://github.com/Zxilly/UA2F.git"
 readonly UA2F_TAG="v5.2.0"
 readonly UA2F_COMMIT="1e7a3fceb42092da9278831d627cff8f25947e29"
@@ -24,6 +25,28 @@ GATE_BLOCKED=0
 fail() {
   echo "::error::$*" >&2
   exit 1
+}
+
+openwrt_source_provenance_gate() {
+  pinned_tree="$1"
+  tag_commit="$2"
+  tag_tree="$3"
+
+  [[ "$pinned_tree" == "$EXPECTED_OPENWRT_TREE" ]] || \
+    fail "Pinned OpenWrt commit ${OPENWRT_COMMIT} has tree ${pinned_tree}, expected ${EXPECTED_OPENWRT_TREE}"
+
+  tag_commit_matches=no
+  tag_tree_matches=no
+  if [[ "$tag_commit" == "$OPENWRT_COMMIT" ]]; then
+    tag_commit_matches=yes
+  fi
+  if [[ "$tag_tree" == "$pinned_tree" ]]; then
+    tag_tree_matches=yes
+  fi
+
+  if [[ "$tag_commit_matches" == no || "$tag_tree_matches" == no ]]; then
+    echo "::warning::${OPENWRT_TAG} differs from immutable OpenWrt source pin: tag_commit=${tag_commit}, tag_tree=${tag_tree}, pinned_commit=${OPENWRT_COMMIT}, pinned_tree=${pinned_tree}"
+  fi
 }
 
 run_make() {
@@ -378,6 +401,7 @@ mkdir -p "$(dirname "$OPENWRT_ROOT")" "$CI_AUDIT_DIR"
   sh "$WORKSPACE/tests/defaults-test.sh"
   sh "$WORKSPACE/tests/dnsmasq-jail-mount-test.sh"
   sh "$WORKSPACE/tests/startup-order-test.sh"
+  bash "$WORKSPACE/tests/openwrt-source-provenance-test.sh"
   python3 "$WORKSPACE/tests/apk-validator-test.py"
   python3 "$WORKSPACE/tests/xkeen-canary-deps-test.py"
 } 2>&1 | tee "$CI_AUDIT_DIR/fixture-tests.log"
@@ -419,20 +443,7 @@ git -C "$OPENWRT_ROOT" fetch --force --depth=1 origin \
 pinned_tree="$(git -C "$OPENWRT_ROOT" rev-parse "${OPENWRT_COMMIT}^{tree}")"
 tag_commit="$(git -C "$OPENWRT_ROOT" rev-parse "${OPENWRT_TAG}^{commit}")"
 tag_tree="$(git -C "$OPENWRT_ROOT" rev-parse "${OPENWRT_TAG}^{tree}")"
-tag_commit_matches=no
-tag_tree_matches=no
-if [[ "$tag_commit" == "$OPENWRT_COMMIT" ]]; then
-  tag_commit_matches=yes
-fi
-if [[ "$tag_tree" == "$pinned_tree" ]]; then
-  tag_tree_matches=yes
-fi
-
-[[ "$tag_tree_matches" == yes ]] || \
-  fail "${OPENWRT_TAG} source tree ${tag_tree} differs from pinned tree ${pinned_tree}"
-if [[ "$tag_commit_matches" == no ]]; then
-  echo "::notice::tag commit differs, but source tree is identical. tag=${tag_commit}, pinned=${OPENWRT_COMMIT}, tree=${pinned_tree}"
-fi
+openwrt_source_provenance_gate "$pinned_tree" "$tag_commit" "$tag_tree"
 
 git -C "$OPENWRT_ROOT" checkout --detach "$OPENWRT_COMMIT"
 [[ "$(git -C "$OPENWRT_ROOT" rev-parse HEAD)" == "$OPENWRT_COMMIT" ]] || \

@@ -283,9 +283,6 @@ def main() -> int:
         fail(f"APK metadata tool is missing: {apk_tool}")
     if not args.public_key.is_file():
         fail(f"Public signing key is missing: {args.public_key}")
-    if args.tag_tree_matches != "yes":
-        fail("Resolved tag tree does not match the pinned source tree")
-
     apk_paths = sorted((source_root / "bin").rglob("*.apk"))
     if not apk_paths:
         fail("The OpenWrt build produced no APK files")
