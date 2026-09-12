@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 
-MAIN_PACKAGES = ("ua2f", "kmod-rkp-ipid", "xray-core")
+MAIN_PACKAGES = ("ua2f", "kmod-rkp-ipid", "xray-core", "jq")
 BASE_PACKAGES = {
     "base-files",
     "busybox",
@@ -174,6 +174,64 @@ def select_unique(records: list[dict[str, Any]], description: str) -> dict[str, 
     fail(f"Ambiguous APKs for {description}: {paths}")
 
 
+def select_and_validate_jq(
+    records: list[dict[str, Any]],
+    expected_arch: str,
+    expected_version: str,
+    expected_output_dir: Path | None = None,
+) -> dict[str, Any]:
+    if len(records) != 1:
+        paths = ", ".join(str(record.get("_path", "<unknown>")) for record in records)
+        fail(f"Expected exactly one built jq APK, found {len(records)}: {paths or 'none'}")
+
+    record = records[0]
+    if record.get("name") != "jq":
+        fail(f"jq APK package name is {record.get('name')!r}, expected 'jq'")
+
+    architecture = str(record.get("arch", record.get("architecture", "")))
+    if architecture != expected_arch:
+        fail(f"jq architecture is {architecture}, expected {expected_arch}")
+
+    if expected_output_dir is not None:
+        apk_path = record_path(record).resolve()
+        if apk_path.parent != expected_output_dir.resolve():
+            fail(
+                f"jq APK came from {apk_path.parent}, "
+                f"expected {expected_output_dir.resolve()}"
+            )
+
+    apk_version = str(record.get("version", ""))
+    if not apk_version.startswith(f"{expected_version}-"):
+        fail(
+            f"jq APK version is {apk_version}, "
+            f"expected {expected_version} release metadata"
+        )
+
+    raw_dependencies = record.get("depends")
+    if not isinstance(raw_dependencies, list):
+        fail(f"jq APK dependency metadata is not a list: {raw_dependencies!r}")
+    for dependency in raw_dependencies:
+        if isinstance(dependency, str):
+            continue
+        if not isinstance(dependency, dict) or not dependency.get("name"):
+            fail(f"jq APK contains invalid dependency metadata: {dependency!r}")
+
+    dependencies = list_values(raw_dependencies)
+    dependency_names = [
+        parse_dependency(dependency)[0] for dependency in dependencies
+    ]
+    if not dependencies or any(
+        not name or name.startswith("!") for name in dependency_names
+    ):
+        fail(f"jq APK dependency metadata is empty or invalid: {raw_dependencies!r}")
+    if "libc" not in dependency_names:
+        fail(f"jq APK runtime dependency metadata does not include libc: {dependencies}")
+    if "oniguruma" in dependency_names:
+        fail(f"standard jq unexpectedly depends on oniguruma: {dependencies}")
+
+    return record
+
+
 def version_matches(record: dict[str, Any], operator: str, required: str) -> bool:
     if not required or operator not in {"=", "=="}:
         return True
@@ -207,7 +265,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tag-tree-matches", choices=("yes", "no"), required=True)
     parser.add_argument("--ua2f-commit", required=True)
     parser.add_argument("--rkp-ipid-commit", required=True)
+    parser.add_argument("--packages-feed-commit", required=True)
     parser.add_argument("--xray-version", required=True)
+    parser.add_argument("--jq-version", required=True)
     parser.add_argument("--public-key", type=Path, required=True)
     parser.add_argument("--kernel-config-diff", type=Path, required=True)
     return parser.parse_args()
@@ -242,8 +302,16 @@ def main() -> int:
             providers[provider_name].append(record)
 
     main_records = {
-        name: select_unique(by_name.get(name, []), name) for name in MAIN_PACKAGES
+        name: select_unique(by_name.get(name, []), name)
+        for name in MAIN_PACKAGES
+        if name != "jq"
     }
+    main_records["jq"] = select_and_validate_jq(
+        by_name.get("jq", []),
+        args.expected_arch,
+        args.jq_version,
+        source_root / "bin" / "packages" / args.expected_arch / "packages",
+    )
 
     for name, record in main_records.items():
         architecture = str(record.get("arch", record.get("architecture", "")))
@@ -260,6 +328,12 @@ def main() -> int:
             f"xray-core APK version is {xray_apk_version}, "
             f"expected {args.xray_version} release metadata"
         )
+
+    jq_apk_version = str(main_records["jq"].get("version", ""))
+    jq_runtime_dependencies = [
+        canonical_dependency(dependency)
+        for dependency in list_values(main_records["jq"].get("depends"))
+    ]
 
     rkp_version = str(main_records["kmod-rkp-ipid"].get("version", ""))
     if not rkp_version.startswith(f"{args.expected_linux}-"):
@@ -413,7 +487,12 @@ def main() -> int:
                 "ua2f_version=5.2.0",
                 f"ua2f_upstream_commit={args.ua2f_commit}",
                 f"rkp_ipid_upstream_commit={args.rkp_ipid_commit}",
+                f"packages_feed_commit={args.packages_feed_commit}",
                 f"xray_core_version={args.xray_version}",
+                f"jq_version={args.jq_version}",
+                f"jq_apk_version={jq_apk_version}",
+                "jq_recipe=feeds/packages/utils/jq/Makefile",
+                f"jq_runtime_dependencies={','.join(jq_runtime_dependencies)}",
                 f"kernel_package_version={args.expected_kernel_version}",
                 f"kmod_rkp_ipid_kernel_dependency={expected_kernel_dependency}",
                 f"rkp_ipid_module_vermagic={module_vermagic}",
@@ -472,6 +551,12 @@ def main() -> int:
         "- rkp-ipid uses firewall marks but this bundle installs no mark, TTL, iptables, or nftables rules.",
         "- Because the package contains /etc/modules.d/99-rkp-ipid, OpenWrt default post-install runs kmodloader and may load it immediately.",
         "",
+        "jq",
+        f"- APK architecture: {main_records['jq'].get('arch', '')}",
+        f"- APK version: {jq_apk_version}",
+        f"- Runtime dependencies: {', '.join(jq_runtime_dependencies)}",
+        "- The standard noregex variant is used; jq-full and Oniguruma are not included.",
+        "",
         "Install-time behavior",
         "- UA2F ships enabled=0. OpenWrt default post-install attempts its init script, which exits before launching UA2F or adding rules; the package patch then removes its boot-enable link.",
         "- On nftables systems UA2F's custom post-install only clears a stale firewall.ua2f UCI include and commits UCI; it does not reload firewall or network.",
@@ -504,6 +589,7 @@ def main() -> int:
         [
             f"apk add {common} {main_records['ua2f']['name']}",
             f"apk add {common} {main_records['kmod-rkp-ipid']['name']}",
+            f"apk add {common} {main_records['jq']['name']}",
             f"apk add {common} {main_records['xray-core']['name']}",
             "",
             "Important: installing kmod-rkp-ipid may load the module immediately through kmodloader.",

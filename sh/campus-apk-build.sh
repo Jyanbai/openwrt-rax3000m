@@ -379,6 +379,7 @@ mkdir -p "$(dirname "$OPENWRT_ROOT")" "$CI_AUDIT_DIR"
   sh "$WORKSPACE/tests/dnsmasq-jail-mount-test.sh"
   sh "$WORKSPACE/tests/startup-order-test.sh"
   python3 "$WORKSPACE/tests/apk-validator-test.py"
+  python3 "$WORKSPACE/tests/xkeen-canary-deps-test.py"
 } 2>&1 | tee "$CI_AUDIT_DIR/fixture-tests.log"
 
 set +e
@@ -494,26 +495,38 @@ official_xray_makefile="$(readlink -f feeds/packages/net/xray-core/Makefile)"
 xray_version="$(sed -n 's/^PKG_VERSION:=//p' "$official_xray_makefile" | head -n1)"
 [[ -n "$xray_version" ]] || fail "Could not determine xray-core version"
 
+# Install jq explicitly from the same source-pinned official packages feed.
+# The pinned recipe lives at utils/jq and its default jq variant is noregex;
+# jq-full is intentionally not selected for the canary's JSON-only usage.
+rm -rf package/feeds/packages/jq
+./scripts/feeds install -f -p packages jq
+jq_makefile="$(readlink -f package/feeds/packages/jq/Makefile)"
+official_jq_makefile="$(readlink -f feeds/packages/utils/jq/Makefile)"
+[[ "$jq_makefile" == "$official_jq_makefile" ]] || \
+  fail "jq is not sourced from the official packages feed"
+jq_version="$(sed -n 's/^PKG_VERSION:=//p' "$official_jq_makefile" | head -n1)"
+[[ -n "$jq_version" ]] || fail "Could not determine jq version"
+
 if [[ -d "$WORKSPACE/files" ]]; then
   cp -a "$WORKSPACE/files" "$OPENWRT_ROOT/files"
 fi
 
 mkdir -p "$STATE_DIR"
 
-# Baseline deliberately excludes only the three requested additions.
+# Baseline deliberately excludes only the four requested additions.
 {
   printf '%s\n' \
     'CONFIG_TARGET_mediatek=y' \
     'CONFIG_TARGET_mediatek_filogic=y' \
     'CONFIG_TARGET_mediatek_filogic_DEVICE_cmcc_rax3000m-emmc=y'
-  grep -Ev '^CONFIG_PACKAGE_(ua2f|kmod-rkp-ipid|xray-core)=' \
+  grep -Ev '^CONFIG_PACKAGE_(ua2f|kmod-rkp-ipid|xray-core|jq)=' \
     "$WORKSPACE/config/config-apk"
 } > .config
 
 make defconfig
 cp .config "$STATE_DIR/baseline-openwrt.config"
 
-for symbol in ua2f kmod-rkp-ipid xray-core; do
+for symbol in ua2f kmod-rkp-ipid xray-core jq; do
   if grep -Eq "^CONFIG_PACKAGE_${symbol}=[my]$" .config; then
     fail "Baseline unexpectedly selected CONFIG_PACKAGE_${symbol}"
   fi
@@ -543,7 +556,7 @@ baseline_release="$KERNEL_RELEASE"
 [[ -n "$baseline_release" ]] || fail "Baseline kernel release could not be determined"
 baseline_kernel_package_version="${baseline_linux}~${baseline_vermagic}-r${baseline_release}"
 
-# Restore the complete config, including the three requested module packages.
+# Restore the complete config, including the four requested module packages.
 {
   printf '%s\n' \
     'CONFIG_TARGET_mediatek=y' \
@@ -555,10 +568,13 @@ baseline_kernel_package_version="${baseline_linux}~${baseline_vermagic}-r${basel
 make defconfig
 cp .config "$STATE_DIR/final-openwrt.config"
 
-for symbol in ua2f kmod-rkp-ipid xray-core; do
+for symbol in ua2f kmod-rkp-ipid xray-core jq; do
   grep -Fqx "CONFIG_PACKAGE_${symbol}=m" .config || \
     fail "CONFIG_PACKAGE_${symbol}=m was silently disabled or changed"
 done
+if grep -Eq '^CONFIG_PACKAGE_(jq-full|ss)=[my]$' .config; then
+  fail "Final config unexpectedly selected jq-full or ss"
+fi
 grep -Fqx 'CONFIG_PACKAGE_portal-dns-guard=y' .config || \
   fail "CONFIG_PACKAGE_portal-dns-guard=y was silently disabled or changed"
 
@@ -600,6 +616,7 @@ run_make target/linux/compile
 run_make package/UA2F/openwrt/compile
 run_make package/rkp-ipid/compile
 run_make package/feeds/packages/xray-core/compile
+run_make package/feeds/packages/jq/compile
 run_make_verbose_logged package/portal-dns-guard/clean \
   "$CI_AUDIT_DIR/portal-dns-guard-package-clean.log"
 run_make_verbose_logged package/portal-dns-guard/compile \
@@ -628,7 +645,9 @@ python3 "$WORKSPACE/sh/campus-apk-bundle.py" \
   --tag-tree-matches "$tag_tree_matches" \
   --ua2f-commit "$UA2F_COMMIT" \
   --rkp-ipid-commit "$RKP_IPID_COMMIT" \
+  --packages-feed-commit "$PACKAGES_FEED_COMMIT" \
   --xray-version "$xray_version" \
+  --jq-version "$jq_version" \
   --public-key "$OPENWRT_ROOT/public-key.pem" \
   --kernel-config-diff "$STATE_DIR/kernel-config.diff"
 
@@ -642,7 +661,7 @@ cp -a \
   "$OUT_DIR/portal-dns-guard-audit/"
 
 grep -E \
-  '^(CONFIG_TARGET_mediatek|CONFIG_TARGET_mediatek_filogic|CONFIG_TARGET_mediatek_filogic_DEVICE_cmcc_rax3000m-emmc|CONFIG_PACKAGE_(portal-dns-guard|dnsmasq|dnsmasq-full|dnsproxy|bind-dig|jsonfilter|ubus|uclient-fetch|ca-bundle))=' \
+  '^(CONFIG_TARGET_mediatek|CONFIG_TARGET_mediatek_filogic|CONFIG_TARGET_mediatek_filogic_DEVICE_cmcc_rax3000m-emmc|CONFIG_PACKAGE_(portal-dns-guard|dnsmasq|dnsmasq-full|dnsproxy|bind-dig|jsonfilter|ubus|uclient-fetch|ca-bundle|ua2f|kmod-rkp-ipid|xray-core|jq|jq-full|ss))=' \
   .config | sort > "$CI_AUDIT_DIR/final-config-relevant.txt"
 
 # Reuse the original repository's signing helper and EC key. It signs APK
@@ -651,6 +670,30 @@ bash "$OPENWRT_ROOT/kmod-sign" "$OUT_DIR"
 if compgen -G "$OUT_DIR/deps/*.apk" >/dev/null; then
   bash "$OPENWRT_ROOT/kmod-sign" "$OUT_DIR/deps"
 fi
+
+main_index_metadata="$OUT_DIR/repository-index-metadata.json"
+"$apk_tool" adbdump --format json "$OUT_DIR/packages.adb" > "$main_index_metadata"
+python3 - "$WORKSPACE/sh/campus-apk-bundle.py" "$main_index_metadata" \
+  "$EXPECTED_ARCH" "$jq_version" <<'PY'
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+bundle_path, metadata_path, expected_arch, expected_version = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("campus_apk_bundle", bundle_path)
+if spec is None or spec.loader is None:
+    raise SystemExit("could not load campus APK bundle validator")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+with Path(metadata_path).open(encoding="utf-8") as source:
+    records = module.extract_records(json.load(source))
+module.select_and_validate_jq(
+    [record for record in records if record.get("name") == "jq"],
+    expected_arch,
+    expected_version,
+)
+PY
 
 public_key_sha256="$(sha256sum "$OUT_DIR/public-key.pem" | awk '{print $1}')"
 cat > "$OUT_DIR/signing-info.txt" <<EOF
@@ -681,11 +724,13 @@ for required in \
   "$OUT_DIR"/ua2f*.apk \
   "$OUT_DIR"/kmod-rkp-ipid*.apk \
   "$OUT_DIR"/xray-core*.apk \
+  "$OUT_DIR"/jq-*.apk \
   "$OUT_DIR/SHA256SUMS" \
   "$OUT_DIR/build-info.txt" \
   "$OUT_DIR/compatibility-report.txt" \
   "$OUT_DIR/install-order.txt" \
   "$OUT_DIR/signing-info.txt" \
+  "$OUT_DIR/repository-index-metadata.json" \
   "$OUT_DIR/public-key.pem" \
   "$OUT_DIR/packages.adb"; do
   [[ -e "$required" ]] || fail "Required artifact output is missing: $required"
